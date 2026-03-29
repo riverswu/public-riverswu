@@ -1,0 +1,569 @@
+name: Fetch Content (Auto)
+
+"on":
+  workflow_dispatch:
+    inputs:
+      timeout:
+        description: "Per request timeout seconds"
+        required: true
+        default: "10"
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+  # Redis
+  REDIS_HOST: ${{ secrets.REDIS_HOST }}
+  REDIS_PORT: ${{ secrets.REDIS_PORT }}
+  REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+
+jobs:
+  # ── Plan: grab a batch via Redis lock, split into runner assignments ─
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner_count: ${{ steps.plan.outputs.runner_count }}
+      total_codes: ${{ steps.plan.outputs.total_codes }}
+      batch_id: ${{ steps.plan.outputs.batch_id }}
+      lock_token: ${{ steps.plan.outputs.lock_token }}
+      matrix_json: ${{ steps.plan.outputs.matrix_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: larkself/gp-announce
+          token: ${{ secrets.LARKSELF_PAT }}
+          ref: main
+          sparse-checkout: |
+            data/content_batches
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install redis
+
+      - name: Grab batch & plan assignments
+        id: plan
+        run: |
+          python3 << 'PYEOF'
+          import gzip, json, math, os, time, uuid
+          from pathlib import Path
+          import redis
+
+          CODES_PER_RUNNER = 50
+          MAX_RUNNERS = 20
+          LOCK_TTL = 7200  # 2 hours
+
+          # Connect to Redis with retry
+          host = os.environ.get("REDIS_HOST") or "172.245.39.37"
+          port = int(os.environ.get("REDIS_PORT") or "6379")
+          password = os.environ.get("REDIS_PASSWORD") or ""
+          print(f"Redis: {host}:{port}")
+
+          r = None
+          for attempt in range(1, 4):
+              try:
+                  r = redis.Redis(
+                      host=host,
+                      port=port,
+                      password=password,
+                      decode_responses=True,
+                      socket_timeout=30,
+                      socket_connect_timeout=30,
+                  )
+                  r.ping()
+                  print(f"Redis connected (attempt {attempt})")
+                  break
+              except Exception as e:
+                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
+                  if attempt == 3:
+                      print("Redis unreachable after 3 attempts, skip this run")
+                      with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                          f.write("runner_count=0\n")
+                          f.write("total_codes=0\n")
+                          f.write("batch_id=\n")
+                          f.write("lock_token=\n")
+                      exit(0)
+                  time.sleep(attempt * 5)
+
+          # List batch files sorted ascending (batch_000, batch_001, ...)
+          batches_dir = Path("data/content_batches")
+          batch_files = sorted(batches_dir.glob("batch_*.json.gz"))
+          print(f"Found {len(batch_files)} batch files")
+
+          if not batch_files:
+              print("No batch files — nothing to do")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("runner_count=0\n")
+                  f.write("total_codes=0\n")
+                  f.write("batch_id=\n")
+                  f.write("lock_token=\n")
+              exit(0)
+
+          # Try to lock a batch
+          token = uuid.uuid4().hex
+          locked_batch = None
+          locked_file = None
+
+          for bf in batch_files:
+              # e.g. batch_000.json.gz → batch_id = "000"
+              batch_id = bf.stem.split("_", 1)[1].split(".")[0]
+              lock_key = f"gp-announce:content-batch:{batch_id}:lock"
+              acquired = r.set(lock_key, token, nx=True, ex=LOCK_TTL)
+              if acquired:
+                  locked_batch = batch_id
+                  locked_file = bf
+                  print(f"Locked batch {batch_id} (key={lock_key})")
+                  break
+              else:
+                  holder = r.get(lock_key)
+                  print(f"  batch {batch_id}: already locked by {holder[:8]}...")
+
+          if locked_batch is None:
+              print("All batches are locked — nothing to do right now")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("runner_count=0\n")
+                  f.write("total_codes=0\n")
+                  f.write("batch_id=\n")
+                  f.write("lock_token=\n")
+              exit(0)
+
+          # Load batch codes
+          with gzip.open(locked_file, "rt") as f:
+              codes = json.load(f)
+          print(f"Batch {locked_batch}: {len(codes)} codes")
+
+          # Split into runners
+          actual_runners = min(math.ceil(len(codes) / CODES_PER_RUNNER), MAX_RUNNERS)
+          per_runner = len(codes) // actual_runners
+          remainder = len(codes) % actual_runners
+
+          assignments = []
+          offset = 0
+          for i in range(actual_runners):
+              n = per_runner + (1 if i < remainder else 0)
+              assignments.append(codes[offset:offset + n])
+              offset += n
+
+          os.makedirs("/tmp/assignments", exist_ok=True)
+          for i, batch in enumerate(assignments):
+              path = f"/tmp/assignments/runner_{i}.json"
+              with open(path, "w") as f:
+                  json.dump(batch, f)
+              print(f"  runner {i}: {len(batch)} codes")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"runner_count={actual_runners}\n")
+              f.write(f"total_codes={len(codes)}\n")
+              f.write(f"batch_id={locked_batch}\n")
+              f.write(f"lock_token={token}\n")
+              f.write(f"matrix_json={json.dumps(list(range(actual_runners)))}\n")
+          PYEOF
+
+      - name: Upload assignments
+        if: steps.plan.outputs.runner_count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignments
+          retention-days: 1
+          path: /tmp/assignments/
+
+  # ── Fetch: each runner fetches its assigned codes ──────────────────
+  fetch:
+    needs: plan
+    if: needs.plan.outputs.runner_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        idx: ${{ fromJson(needs.plan.outputs.matrix_json) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: larkself/gp-announce
+          token: ${{ secrets.LARKSELF_PAT }}
+          ref: main
+          sparse-checkout: |
+            scripts/fetch_content_simple.py
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pandas pyarrow requests urllib3
+
+      - name: Download assignments
+        uses: actions/download-artifact@v4
+        with:
+          name: assignments
+          path: /tmp/assignments
+
+      - name: Fetch content
+        run: |
+          python -u scripts/fetch_content_simple.py \
+            --codes-file "/tmp/assignments/runner_${{ matrix.idx }}.json" \
+            --runner-idx ${{ matrix.idx }} \
+            --output-dir /tmp/output \
+            --timeout ${{ inputs.timeout }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.idx }}
+          retention-days: 1
+          if-no-files-found: ignore
+          path: /tmp/output/
+
+  # ── Merge: collect outputs, push, delete batch file ────────────────
+  merge:
+    needs: [plan, fetch]
+    if: always() && needs.plan.outputs.runner_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      push_ok: ${{ steps.push.outputs.push_ok }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: larkself/gp-announce
+          token: ${{ secrets.LARKSELF_PAT }}
+          ref: main
+          sparse-checkout: |
+            data/content_fetch_success
+            data/candidates
+            data/content_batches
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pandas pyarrow redis
+
+      - name: Download all runner results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: /tmp/all-results
+          merge-multiple: true
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.LARKSELF_PAT }}@github.com/larkself/gp-announce.git"
+
+      - name: Merge and push
+        id: push
+        env:
+          BATCH_ID: ${{ needs.plan.outputs.batch_id }}
+          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
+        run: |
+          # Write the merge script to a file so it can be re-run after rebase
+          cat > /tmp/merge_and_stage.py << 'PYEOF'
+          """
+          Merge runner outputs into the repo working tree and stage changes.
+          Idempotent: safe to re-run after git rebase.
+          """
+          import gzip, json, os, re, subprocess
+          from pathlib import Path
+
+          results_dir = Path("/tmp/all-results")
+          repo_root = Path(os.environ.get("GITHUB_WORKSPACE", "."))
+          raw_content = repo_root / "raw" / "content"
+          success_dir = repo_root / "data" / "content_fetch_success"
+          candidates_dir = repo_root / "data" / "candidates"
+          batch_id = os.environ["BATCH_ID"]
+
+          # ── 0. Discover existing max part numbers ──
+          max_part: dict[str, int] = {}
+          ls = subprocess.run(
+              ["git", "ls-tree", "-r", "HEAD", "--name-only", "--", "raw/content/"],
+              capture_output=True, text=True, cwd=str(repo_root),
+          )
+          for line in (ls.stdout or "").strip().splitlines():
+              name = os.path.basename(line)
+              m = re.match(r"^(\d{6})_(\d{3})\.parquet$", name)
+              if m:
+                  ym, num = m.group(1), int(m.group(2))
+                  max_part[ym] = max(max_part.get(ym, 0), num)
+          print(f"Existing max part numbers: {max_part}")
+
+          # ── 1. Merge runner parquets → one per month ──
+          parquet_src = results_dir / "parquet"
+          parquet_count = 0
+          new_parquets: list[str] = []
+          if parquet_src.exists():
+              import pandas as pd
+              for ym_dir in sorted(d for d in parquet_src.iterdir() if d.is_dir()):
+                  ym = ym_dir.name
+                  pq_files = sorted(ym_dir.glob("*.parquet"))
+                  if not pq_files:
+                      continue
+                  frames = [pd.read_parquet(pq) for pq in pq_files]
+                  merged_df = pd.concat(frames, ignore_index=True)
+                  parquet_count += len(merged_df)
+
+                  dest_dir = raw_content / ym
+                  dest_dir.mkdir(parents=True, exist_ok=True)
+                  next_num = max_part.get(ym, 0) + 1
+                  dest = dest_dir / f"{ym}_{next_num:03d}.parquet"
+                  merged_df.to_parquet(dest, index=False)
+                  new_parquets.append(str(dest.relative_to(repo_root)))
+                  print(f"  {ym}: {len(pq_files)} runner files -> {dest.name} ({len(merged_df)} rows)")
+                  max_part[ym] = next_num
+          print(f"Saved {parquet_count} rows in {len(new_parquets)} parquet(s)")
+
+          # ── 2. Merge success fragments → success JSONs ──
+          success_src = results_dir / "success"
+          updated_yms = set()
+          if success_src.exists():
+              merged: dict[str, dict[str, set]] = {}
+              for frag in sorted(success_src.glob("runner_*.json")):
+                  data = json.loads(frag.read_text("utf-8"))
+                  for ym, date_codes in data.items():
+                      if ym not in merged:
+                          merged[ym] = {}
+                      for date_str, codes in date_codes.items():
+                          if date_str not in merged[ym]:
+                              merged[ym][date_str] = set()
+                          merged[ym][date_str].update(codes)
+
+              # Load candidates for all_done detection
+              candidate_by_date: dict[str, set] = {}
+              for gz in sorted(candidates_dir.glob("candidates_*.json.gz")):
+                  try:
+                      with gzip.open(gz, "rt") as f:
+                          items = json.load(f)
+                      if isinstance(items, dict):
+                          items = items.get("items", [])
+                      for it in items:
+                          nd = it.get("notice_date", "")[:10]
+                          code = it.get("art_code", "")
+                          if nd and code:
+                              candidate_by_date.setdefault(nd, set()).add(code)
+                  except Exception as e:
+                      print(f"Warning: failed to load {gz}: {e}")
+              print(f"Loaded candidates for {len(candidate_by_date)} dates")
+
+              for ym, date_codes in merged.items():
+                  path = success_dir / f"content_success_{ym}.json"
+                  existing: dict = {}
+                  if path.exists():
+                      try:
+                          existing = json.loads(path.read_text("utf-8"))
+                      except Exception:
+                          pass
+
+                  for date_str, new_codes in date_codes.items():
+                      old = existing.get(date_str)
+                      if old == "all_done":
+                          continue
+                      combined = set(old) | new_codes if isinstance(old, list) else set(new_codes)
+
+                      total = candidate_by_date.get(date_str, set())
+                      if total and combined >= total:
+                          existing[date_str] = "all_done"
+                          print(f"  {date_str}: all_done ({len(combined)}/{len(total)})")
+                      else:
+                          existing[date_str] = sorted(combined)
+
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_text(
+                      json.dumps(existing, ensure_ascii=False, indent=2) + "\n", "utf-8",
+                  )
+                  updated_yms.add(ym)
+                  print(f"Updated {path.name}")
+
+          print(f"Updated {len(updated_yms)} success JSON files")
+
+          # ── 3. Remove the batch file ──
+          batch_file = repo_root / "data" / "content_batches" / f"batch_{batch_id}.json.gz"
+          if batch_file.exists():
+              batch_file.unlink()
+              print(f"Removed batch file: batch_{batch_id}.json.gz")
+
+          # ── 4. Stage everything ──
+          subprocess.run(
+              ["git", "add", "raw/content/", "data/content_fetch_success/", "data/content_batches/"],
+              cwd=str(repo_root), check=True,
+          )
+          print("Staged all changes")
+          PYEOF
+
+          # Disable sparse-checkout so git add works for all paths
+          git sparse-checkout disable
+
+          # Run the merge script
+          python3 /tmp/merge_and_stage.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+            echo "push_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
+
+          # Push with rebase-retry; re-run merge script after each rebase
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          for i in $(seq 1 10); do
+            if git push origin "HEAD:$BRANCH" 2>/dev/null; then
+              echo "Pushed (attempt $i)"
+              echo "push_ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Push failed, rebase and re-merge (attempt $i/10)..."
+            # Reset to before our commit, pull latest, re-run merge, recommit
+            git reset --soft HEAD~1
+            git stash --include-untracked
+            git pull --rebase origin "$BRANCH"
+            git stash pop || true
+            # Re-run merge script to fix success JSON against latest HEAD
+            python3 /tmp/merge_and_stage.py
+            if git diff --cached --quiet; then
+              echo "No changes after re-merge"
+              echo "push_ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
+            sleep $((RANDOM % 5 + i * 2))
+          done
+          echo "Push failed after 10 attempts"
+          echo "push_ok=false" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Release lock on success
+        if: steps.push.outputs.push_ok == 'true'
+        env:
+          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
+          BATCH_ID: ${{ needs.plan.outputs.batch_id }}
+        run: |
+          python3 << 'PYEOF'
+          import os, time, redis
+
+          r = None
+          for attempt in range(1, 4):
+              try:
+                  r = redis.Redis(
+                      host=os.environ.get("REDIS_HOST") or "172.245.39.37",
+                      port=int(os.environ.get("REDIS_PORT") or "6379"),
+                      password=os.environ.get("REDIS_PASSWORD") or "",
+                      decode_responses=True,
+                      socket_timeout=30,
+                      socket_connect_timeout=30,
+                  )
+                  r.ping()
+                  break
+              except Exception as e:
+                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
+                  if attempt == 3:
+                      print("Redis unreachable, lock will expire via TTL")
+                      exit(0)
+                  time.sleep(attempt * 5)
+          batch_id = os.environ["BATCH_ID"]
+          token = os.environ["LOCK_TOKEN"]
+          lock_key = f"gp-announce:content-batch:{batch_id}:lock"
+
+          script = """
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+              return redis.call("del", KEYS[1])
+          else
+              return 0
+          end
+          """
+          result = r.eval(script, 1, lock_key, token)
+          if result:
+              print(f"Released lock {lock_key}")
+          else:
+              print(f"Lock {lock_key} already released or taken by another holder")
+          PYEOF
+
+  # ── Cleanup: release lock if merge failed ──────────────────────────
+  cleanup:
+    needs: [plan, merge]
+    if: always() && needs.plan.outputs.batch_id != '' && needs.merge.outputs.push_ok != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install redis
+        run: pip install redis
+
+      - name: Release lock (failure cleanup)
+        env:
+          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
+          BATCH_ID: ${{ needs.plan.outputs.batch_id }}
+        run: |
+          python3 << 'PYEOF'
+          import os, time, redis
+
+          r = None
+          for attempt in range(1, 4):
+              try:
+                  r = redis.Redis(
+                      host=os.environ.get("REDIS_HOST") or "172.245.39.37",
+                      port=int(os.environ.get("REDIS_PORT") or "6379"),
+                      password=os.environ.get("REDIS_PASSWORD") or "",
+                      decode_responses=True,
+                      socket_timeout=30,
+                      socket_connect_timeout=30,
+                  )
+                  r.ping()
+                  break
+              except Exception as e:
+                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
+                  if attempt == 3:
+                      print("Redis unreachable, lock will expire via TTL")
+                      exit(0)
+                  time.sleep(attempt * 5)
+          batch_id = os.environ["BATCH_ID"]
+          token = os.environ["LOCK_TOKEN"]
+          lock_key = f"gp-announce:content-batch:{batch_id}:lock"
+
+          script = """
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+              return redis.call("del", KEYS[1])
+          else
+              return 0
+          end
+          """
+          result = r.eval(script, 1, lock_key, token)
+          if result:
+              print(f"Released lock {lock_key} (cleanup after failure)")
+          else:
+              print(f"Lock {lock_key} already released or taken by another holder")
+          PYEOF
+
+  # ── Summary ─────────────────────────────────────────────────────────
+  summary:
+    needs: [plan, fetch, merge]
+    if: always() && needs.plan.outputs.runner_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        run: |
+          echo "## Auto-Fetch Content Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Batch ID: ${{ needs.plan.outputs.batch_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Total codes: ${{ needs.plan.outputs.total_codes }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runners used: ${{ needs.plan.outputs.runner_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Fetch job status: ${{ needs.fetch.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Merge job status: ${{ needs.merge.result }}" >> "$GITHUB_STEP_SUMMARY"
