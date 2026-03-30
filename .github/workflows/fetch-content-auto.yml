@@ -107,52 +107,29 @@ jobs:
                   f.write("batch_id=\n")
               exit(0)
 
-          # Try to lock a batch — single Lua round trip instead of N*2 calls
+          # Try to lock a batch — random pick + single SET NX per attempt
+          import random
           token = uuid.uuid4().hex
           locked_batch = None
-          locked_file = None
 
-          # Build batch_id → file mapping (sorted ascending)
-          import random
+          # Build batch_id → file mapping
           batch_map: dict[str, Path] = {}
           for bf in batch_files:
               bid = bf.stem.split("_", 1)[1].split(".")[0]
               batch_map[bid] = bf
 
-          # Randomize within a window to reduce contention across parallel workflows
-          WINDOW = 50
-          all_bids = list(batch_map.keys())  # already sorted from batch_files
-          head = all_bids[:WINDOW]
-          tail = all_bids[WINDOW:]
-          random.shuffle(head)
-          ordered_bids = head + tail
+          # Shuffle all batch IDs, then try one at a time
+          candidates = list(batch_map.keys())
+          random.shuffle(candidates)
 
-          # Lua: try SET NX EX on each key, return the first one that succeeds
-          lock_lua = """
-          local token = ARGV[1]
-          local ttl = tonumber(ARGV[2])
-          for i, key in ipairs(KEYS) do
-              if redis.call("SET", key, token, "NX", "EX", ttl) then
-                  return key
-              end
-          end
-          return nil
-          """
-          lock_keys = [f"gp-announce:content-batch:{bid}:lock" for bid in ordered_bids]
-          # Send keys in small batches to avoid huge EVAL payload over network
-          BATCH_SIZE = 50
-          result = None
-          for i in range(0, len(ordered_bids), BATCH_SIZE):
-              chunk = ordered_bids[i:i + BATCH_SIZE]
-              keys = [f"gp-announce:content-batch:{bid}:lock" for bid in chunk]
-              result = r.eval(lock_lua, len(keys), *keys, token, LOCK_TTL)
-              if result:
+          MAX_LOCK_TRIES = 10
+          for i, bid in enumerate(candidates[:MAX_LOCK_TRIES]):
+              key = f"gp-announce:content-batch:{bid}:lock"
+              if r.set(key, token, nx=True, ex=LOCK_TTL):
+                  locked_batch = bid
+                  print(f"Locked batch {bid} (attempt {i+1})")
                   break
-          if result:
-              # result is the key that was locked, e.g. "gp-announce:content-batch:042:lock"
-              locked_batch = result.split(":")[2]
-              locked_file = batch_map[locked_batch]
-              print(f"Locked batch {locked_batch} (key={result})")
+              print(f"  batch {bid} already locked, try next")
 
           if locked_batch is None:
               print("All batches are locked — nothing to do right now")
@@ -163,6 +140,7 @@ jobs:
               exit(0)
 
           # Load batch codes
+          locked_file = batch_map[locked_batch]
           with gzip.open(locked_file, "rt") as f:
               codes = json.load(f)
           print(f"Batch {locked_batch}: {len(codes)} codes")
