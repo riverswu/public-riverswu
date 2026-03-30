@@ -17,7 +17,6 @@ env:
   REDIS_HOST: ${{ secrets.REDIS_HOST }}
   REDIS_PORT: ${{ secrets.REDIS_PORT }}
   REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
-  LOCK_API_URL: ${{ secrets.LOCK_API_URL }}
 
 jobs:
   # ── Plan: grab a batch via Redis lock, split into runner assignments ─
@@ -45,24 +44,55 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install redis requests
+        run: pip install redis
 
       - name: Grab batch & plan assignments
         id: plan
         run: |
           python3 << 'PYEOF'
-          import gzip, json, math, os, random, time, uuid
+          import gzip, json, math, os, time, uuid
           from pathlib import Path
+          import redis
 
           CODES_PER_RUNNER = 50
           MAX_RUNNERS = 20
           LOCK_TTL = 3600  # 1 hour, auto-expire
 
-          def write_empty_output():
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("runner_count=0\n")
-                  f.write("total_codes=0\n")
-                  f.write("batch_id=\n")
+          # Connect to Redis with retry
+          host = os.environ.get("REDIS_HOST") or "172.245.39.37"
+          port = int(os.environ.get("REDIS_PORT") or "6379")
+          password = os.environ.get("REDIS_PASSWORD") or ""
+          print(f"Redis: {host}:{port}")
+
+          r = None
+          MAX_RETRIES = 5
+          for attempt in range(1, MAX_RETRIES + 1):
+              try:
+                  r = redis.Redis(
+                      host=host,
+                      port=port,
+                      password=password,
+                      decode_responses=True,
+                      socket_timeout=15,
+                      socket_connect_timeout=15,
+                      retry_on_timeout=True,
+                  )
+                  r.ping()
+                  print(f"Redis connected (attempt {attempt})")
+                  break
+              except Exception as e:
+                  print(f"Redis connect attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                  if attempt == MAX_RETRIES:
+                      print(f"Redis unreachable after {MAX_RETRIES} attempts, skip this run")
+                      with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                          f.write("runner_count=0\n")
+                          f.write("total_codes=0\n")
+                          f.write("batch_id=\n")
+                      exit(0)
+                  import random as _rnd
+                  backoff = min(2 ** attempt, 30) + _rnd.uniform(0, 3)
+                  print(f"  retrying in {backoff:.1f}s...")
+                  time.sleep(backoff)
 
           # List batch files sorted ascending (batch_000, batch_001, ...)
           batches_dir = Path("data/content_batches")
@@ -71,10 +101,19 @@ jobs:
 
           if not batch_files:
               print("No batch files — nothing to do")
-              write_empty_output()
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("runner_count=0\n")
+                  f.write("total_codes=0\n")
+                  f.write("batch_id=\n")
               exit(0)
 
-          # Build batch_id → file mapping
+          # Try to lock a batch — single Lua round trip instead of N*2 calls
+          token = uuid.uuid4().hex
+          locked_batch = None
+          locked_file = None
+
+          # Build batch_id → file mapping (sorted ascending)
+          import random
           batch_map: dict[str, Path] = {}
           for bf in batch_files:
               bid = bf.stem.split("_", 1)[1].split(".")[0]
@@ -82,94 +121,46 @@ jobs:
 
           # Randomize within a window to reduce contention across parallel workflows
           WINDOW = 50
-          all_bids = list(batch_map.keys())
+          all_bids = list(batch_map.keys())  # already sorted from batch_files
           head = all_bids[:WINDOW]
           tail = all_bids[WINDOW:]
           random.shuffle(head)
           ordered_bids = head + tail
 
-          locked_batch = None
-
-          # ── Strategy 1: Lock API (single HTTP call, Redis runs on VPS locally) ──
-          api_url = os.environ.get("LOCK_API_URL", "").rstrip("/")
-          if api_url:
-              import requests as req
-              try:
-                  resp = req.post(
-                      f"{api_url}/lock",
-                      json={"batch_ids": ordered_bids, "ttl": LOCK_TTL},
-                      timeout=10,
-                  )
-                  resp.raise_for_status()
-                  data = resp.json()
-                  if data.get("locked"):
-                      locked_batch = data["batch_id"]
-                      print(f"[API] Locked batch {locked_batch}")
-                  else:
-                      print("[API] All batches locked — nothing to do")
-                      write_empty_output()
-                      exit(0)
-              except Exception as e:
-                  print(f"[API] Failed: {e}, falling back to direct Redis")
-
-          # ── Strategy 2: Direct Redis fallback (batched EVAL) ──
-          if locked_batch is None:
-              import redis
-              host = os.environ.get("REDIS_HOST") or "172.245.39.37"
-              port = int(os.environ.get("REDIS_PORT") or "6379")
-              password = os.environ.get("REDIS_PASSWORD") or ""
-              print(f"Redis direct: {host}:{port}")
-
-              r = None
-              MAX_RETRIES = 3
-              for attempt in range(1, MAX_RETRIES + 1):
-                  try:
-                      r = redis.Redis(
-                          host=host, port=port, password=password,
-                          decode_responses=True,
-                          socket_timeout=10,
-                          socket_connect_timeout=10,
-                          retry_on_timeout=True,
-                      )
-                      r.ping()
-                      print(f"Redis connected (attempt {attempt})")
-                      break
-                  except Exception as e:
-                      print(f"Redis attempt {attempt}/{MAX_RETRIES} failed: {e}")
-                      if attempt == MAX_RETRIES:
-                          print("Redis unreachable, skip this run")
-                          write_empty_output()
-                          exit(0)
-                      time.sleep(min(2 ** attempt, 10) + random.uniform(0, 2))
-
-              token = uuid.uuid4().hex
-              lock_lua = """
-              local token = ARGV[1]
-              local ttl = tonumber(ARGV[2])
-              for i, key in ipairs(KEYS) do
-                  if redis.call("SET", key, token, "NX", "EX", ttl) then
-                      return key
-                  end
+          # Lua: try SET NX EX on each key, return the first one that succeeds
+          lock_lua = """
+          local token = ARGV[1]
+          local ttl = tonumber(ARGV[2])
+          for i, key in ipairs(KEYS) do
+              if redis.call("SET", key, token, "NX", "EX", ttl) then
+                  return key
               end
-              return nil
-              """
-              BATCH_SIZE = 50
-              result = None
-              for i in range(0, len(ordered_bids), BATCH_SIZE):
-                  chunk = ordered_bids[i:i + BATCH_SIZE]
-                  keys = [f"gp-announce:content-batch:{bid}:lock" for bid in chunk]
-                  result = r.eval(lock_lua, len(keys), *keys, token, LOCK_TTL)
-                  if result:
-                      break
+          end
+          return nil
+          """
+          lock_keys = [f"gp-announce:content-batch:{bid}:lock" for bid in ordered_bids]
+          # Send keys in small batches to avoid huge EVAL payload over network
+          BATCH_SIZE = 50
+          result = None
+          for i in range(0, len(ordered_bids), BATCH_SIZE):
+              chunk = ordered_bids[i:i + BATCH_SIZE]
+              keys = [f"gp-announce:content-batch:{bid}:lock" for bid in chunk]
+              result = r.eval(lock_lua, len(keys), *keys, token, LOCK_TTL)
               if result:
-                  locked_batch = result.split(":")[2]
-                  print(f"[Redis] Locked batch {locked_batch}")
-              else:
-                  print("[Redis] All batches locked — nothing to do")
-                  write_empty_output()
-                  exit(0)
+                  break
+          if result:
+              # result is the key that was locked, e.g. "gp-announce:content-batch:042:lock"
+              locked_batch = result.split(":")[2]
+              locked_file = batch_map[locked_batch]
+              print(f"Locked batch {locked_batch} (key={result})")
 
-          locked_file = batch_map[locked_batch]
+          if locked_batch is None:
+              print("All batches are locked — nothing to do right now")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("runner_count=0\n")
+                  f.write("total_codes=0\n")
+                  f.write("batch_id=\n")
+              exit(0)
 
           # Load batch codes
           with gzip.open(locked_file, "rt") as f:
