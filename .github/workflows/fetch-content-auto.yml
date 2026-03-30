@@ -27,7 +27,6 @@ jobs:
       runner_count: ${{ steps.plan.outputs.runner_count }}
       total_codes: ${{ steps.plan.outputs.total_codes }}
       batch_id: ${{ steps.plan.outputs.batch_id }}
-      lock_token: ${{ steps.plan.outputs.lock_token }}
       matrix_json: ${{ steps.plan.outputs.matrix_json }}
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +56,7 @@ jobs:
 
           CODES_PER_RUNNER = 50
           MAX_RUNNERS = 20
-          LOCK_TTL = 7200  # 2 hours
+          LOCK_TTL = 3600  # 1 hour, auto-expire
 
           # Connect to Redis with retry
           host = os.environ.get("REDIS_HOST") or "172.245.39.37"
@@ -89,7 +88,6 @@ jobs:
                           f.write("runner_count=0\n")
                           f.write("total_codes=0\n")
                           f.write("batch_id=\n")
-                          f.write("lock_token=\n")
                       exit(0)
                   import random as _rnd
                   backoff = min(2 ** attempt, 30) + _rnd.uniform(0, 3)
@@ -107,7 +105,6 @@ jobs:
                   f.write("runner_count=0\n")
                   f.write("total_codes=0\n")
                   f.write("batch_id=\n")
-                  f.write("lock_token=\n")
               exit(0)
 
           # Try to lock a batch — single Lua round trip instead of N*2 calls
@@ -155,7 +152,6 @@ jobs:
                   f.write("runner_count=0\n")
                   f.write("total_codes=0\n")
                   f.write("batch_id=\n")
-                  f.write("lock_token=\n")
               exit(0)
 
           # Load batch codes
@@ -186,7 +182,6 @@ jobs:
               f.write(f"runner_count={actual_runners}\n")
               f.write(f"total_codes={len(codes)}\n")
               f.write(f"batch_id={locked_batch}\n")
-              f.write(f"lock_token={token}\n")
               f.write(f"matrix_json={json.dumps(list(range(actual_runners)))}\n")
           PYEOF
 
@@ -256,8 +251,6 @@ jobs:
     if: always() && needs.plan.outputs.runner_count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    outputs:
-      push_ok: ${{ steps.push.outputs.push_ok }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -274,7 +267,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install pandas pyarrow redis
+        run: pip install pandas pyarrow
 
       - name: Download all runner results
         uses: actions/download-artifact@v4
@@ -293,7 +286,6 @@ jobs:
         id: push
         env:
           BATCH_ID: ${{ needs.plan.outputs.batch_id }}
-          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
         run: |
           # Write the merge script to a file so it can be re-run after rebase
           cat > /tmp/merge_and_stage.py << 'PYEOF'
@@ -367,7 +359,6 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No changes to push"
-            echo "push_ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -384,7 +375,6 @@ jobs:
           for i in $(seq 1 5); do
             if git push origin "HEAD:$BRANCH" 2>/dev/null; then
               echo "Pushed (attempt $i)"
-              echo "push_ok=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "Push failed (attempt $i/5), re-fetch + rebase..."
@@ -392,116 +382,8 @@ jobs:
             git rebase "origin/$BRANCH"
             sleep $((RANDOM % 3 + 1))
           done
-          echo "Push failed after 10 attempts"
-          echo "push_ok=false" >> "$GITHUB_OUTPUT"
+          echo "Push failed after 5 attempts"
           exit 1
-
-      - name: Release lock on success
-        if: steps.push.outputs.push_ok == 'true'
-        env:
-          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
-          BATCH_ID: ${{ needs.plan.outputs.batch_id }}
-        run: |
-          python3 << 'PYEOF'
-          import os, time, random, redis
-
-          r = None
-          for attempt in range(1, 4):
-              try:
-                  r = redis.Redis(
-                      host=os.environ.get("REDIS_HOST") or "172.245.39.37",
-                      port=int(os.environ.get("REDIS_PORT") or "6379"),
-                      password=os.environ.get("REDIS_PASSWORD") or "",
-                      decode_responses=True,
-                      socket_timeout=10,
-                      socket_connect_timeout=10,
-                      retry_on_timeout=True,
-                  )
-                  r.ping()
-                  break
-              except Exception as e:
-                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
-                  if attempt == 3:
-                      print("Redis unreachable, lock will expire via TTL")
-                      exit(0)
-                  time.sleep(min(2 ** attempt, 10) + random.uniform(0, 2))
-          batch_id = os.environ["BATCH_ID"]
-          token = os.environ["LOCK_TOKEN"]
-          lock_key = f"gp-announce:content-batch:{batch_id}:lock"
-
-          script = """
-          if redis.call("get", KEYS[1]) == ARGV[1] then
-              return redis.call("del", KEYS[1])
-          else
-              return 0
-          end
-          """
-          result = r.eval(script, 1, lock_key, token)
-          if result:
-              print(f"Released lock {lock_key}")
-          else:
-              print(f"Lock {lock_key} already released or taken by another holder")
-          PYEOF
-
-  # ── Cleanup: release lock if merge failed ──────────────────────────
-  cleanup:
-    needs: [plan, merge]
-    if: always() && needs.plan.outputs.batch_id != '' && needs.merge.outputs.push_ok != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install redis
-        run: pip install redis
-
-      - name: Release lock (failure cleanup)
-        env:
-          LOCK_TOKEN: ${{ needs.plan.outputs.lock_token }}
-          BATCH_ID: ${{ needs.plan.outputs.batch_id }}
-        run: |
-          python3 << 'PYEOF'
-          import os, time, random, redis
-
-          r = None
-          for attempt in range(1, 4):
-              try:
-                  r = redis.Redis(
-                      host=os.environ.get("REDIS_HOST") or "172.245.39.37",
-                      port=int(os.environ.get("REDIS_PORT") or "6379"),
-                      password=os.environ.get("REDIS_PASSWORD") or "",
-                      decode_responses=True,
-                      socket_timeout=10,
-                      socket_connect_timeout=10,
-                      retry_on_timeout=True,
-                  )
-                  r.ping()
-                  break
-              except Exception as e:
-                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
-                  if attempt == 3:
-                      print("Redis unreachable, lock will expire via TTL")
-                      exit(0)
-                  time.sleep(min(2 ** attempt, 10) + random.uniform(0, 2))
-          batch_id = os.environ["BATCH_ID"]
-          token = os.environ["LOCK_TOKEN"]
-          lock_key = f"gp-announce:content-batch:{batch_id}:lock"
-
-          script = """
-          if redis.call("get", KEYS[1]) == ARGV[1] then
-              return redis.call("del", KEYS[1])
-          else
-              return 0
-          end
-          """
-          result = r.eval(script, 1, lock_key, token)
-          if result:
-              print(f"Released lock {lock_key} (cleanup after failure)")
-          else:
-              print(f"Lock {lock_key} already released or taken by another holder")
-          PYEOF
 
   # ── Summary ─────────────────────────────────────────────────────────
   summary:
