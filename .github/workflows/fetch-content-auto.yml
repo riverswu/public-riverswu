@@ -403,7 +403,7 @@ jobs:
           BATCH_ID: ${{ needs.plan.outputs.batch_id }}
         run: |
           python3 << 'PYEOF'
-          import os, time, redis
+          import os, time, random, redis
 
           r = None
           for attempt in range(1, 4):
@@ -413,8 +413,9 @@ jobs:
                       port=int(os.environ.get("REDIS_PORT") or "6379"),
                       password=os.environ.get("REDIS_PASSWORD") or "",
                       decode_responses=True,
-                      socket_timeout=30,
-                      socket_connect_timeout=30,
+                      socket_timeout=10,
+                      socket_connect_timeout=10,
+                      retry_on_timeout=True,
                   )
                   r.ping()
                   break
@@ -423,7 +424,7 @@ jobs:
                   if attempt == 3:
                       print("Redis unreachable, lock will expire via TTL")
                       exit(0)
-                  time.sleep(attempt * 5)
+                  time.sleep(min(2 ** attempt, 10) + random.uniform(0, 2))
           batch_id = os.environ["BATCH_ID"]
           token = os.environ["LOCK_TOKEN"]
           lock_key = f"gp-announce:content-batch:{batch_id}:lock"
@@ -462,7 +463,7 @@ jobs:
           BATCH_ID: ${{ needs.plan.outputs.batch_id }}
         run: |
           python3 << 'PYEOF'
-          import os, time, redis
+          import os, time, random, redis
 
           r = None
           for attempt in range(1, 4):
@@ -472,8 +473,9 @@ jobs:
                       port=int(os.environ.get("REDIS_PORT") or "6379"),
                       password=os.environ.get("REDIS_PASSWORD") or "",
                       decode_responses=True,
-                      socket_timeout=30,
-                      socket_connect_timeout=30,
+                      socket_timeout=10,
+                      socket_connect_timeout=10,
+                      retry_on_timeout=True,
                   )
                   r.ping()
                   break
@@ -482,7 +484,7 @@ jobs:
                   if attempt == 3:
                       print("Redis unreachable, lock will expire via TTL")
                       exit(0)
-                  time.sleep(attempt * 5)
+                  time.sleep(min(2 ** attempt, 10) + random.uniform(0, 2))
           batch_id = os.environ["BATCH_ID"]
           token = os.environ["LOCK_TOKEN"]
           lock_key = f"gp-announce:content-batch:{batch_id}:lock"
