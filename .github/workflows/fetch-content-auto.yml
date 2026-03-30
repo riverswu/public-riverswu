@@ -345,12 +345,21 @@ jobs:
             exit 0
           fi
 
-          # Move HEAD to latest remote tip before committing, so our commit
-          # is based on the newest state. Staged changes are preserved since
-          # our files (batch_id names) don't exist in remote.
+          # Move HEAD to latest remote tip, then re-stage only our files.
+          # reset --soft keeps the index, which may include OTHER workflows'
+          # changes as reverse diffs, so we must clear and re-add explicitly.
           BRANCH="${GITHUB_REF_NAME:-main}"
           git fetch --depth=1 origin "$BRANCH"
           git reset --soft "origin/$BRANCH"
+          git reset HEAD -- . >/dev/null 2>&1  # unstage everything
+
+          # Re-run merge script to re-stage only our own files
+          python3 /tmp/merge_and_stage.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to push (after re-stage)"
+            exit 0
+          fi
 
           git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
 
