@@ -240,8 +240,6 @@ jobs:
           token: ${{ secrets.LARKSELF_PAT }}
           ref: main
           sparse-checkout: |
-            data/content_fetch_success
-            data/candidates
             data/content_batches
           sparse-checkout-cone-mode: false
           fetch-depth: 1
@@ -278,14 +276,12 @@ jobs:
           Merge runner outputs into the repo working tree and stage changes.
           Idempotent: safe to re-run after git rebase.
           """
-          import gzip, json, os, re, subprocess
+          import os, re, subprocess
           from pathlib import Path
 
           results_dir = Path("/tmp/all-results")
           repo_root = Path(os.environ.get("GITHUB_WORKSPACE", "."))
           raw_content = repo_root / "raw" / "content"
-          success_dir = repo_root / "data" / "content_fetch_success"
-          candidates_dir = repo_root / "data" / "candidates"
           batch_id = os.environ["BATCH_ID"]
 
           # ── 0. Discover existing max part numbers ──
@@ -327,78 +323,15 @@ jobs:
                   max_part[ym] = next_num
           print(f"Saved {parquet_count} rows in {len(new_parquets)} parquet(s)")
 
-          # ── 2. Merge success fragments → success JSONs ──
-          success_src = results_dir / "success"
-          updated_yms = set()
-          if success_src.exists():
-              merged: dict[str, dict[str, set]] = {}
-              for frag in sorted(success_src.glob("runner_*.json")):
-                  data = json.loads(frag.read_text("utf-8"))
-                  for ym, date_codes in data.items():
-                      if ym not in merged:
-                          merged[ym] = {}
-                      for date_str, codes in date_codes.items():
-                          if date_str not in merged[ym]:
-                              merged[ym][date_str] = set()
-                          merged[ym][date_str].update(codes)
-
-              # Load candidates for all_done detection
-              candidate_by_date: dict[str, set] = {}
-              for gz in sorted(candidates_dir.glob("candidates_*.json.gz")):
-                  try:
-                      with gzip.open(gz, "rt") as f:
-                          items = json.load(f)
-                      if isinstance(items, dict):
-                          items = items.get("items", [])
-                      for it in items:
-                          nd = it.get("notice_date", "")[:10]
-                          code = it.get("art_code", "")
-                          if nd and code:
-                              candidate_by_date.setdefault(nd, set()).add(code)
-                  except Exception as e:
-                      print(f"Warning: failed to load {gz}: {e}")
-              print(f"Loaded candidates for {len(candidate_by_date)} dates")
-
-              for ym, date_codes in merged.items():
-                  path = success_dir / f"content_success_{ym}.json"
-                  existing: dict = {}
-                  if path.exists():
-                      try:
-                          existing = json.loads(path.read_text("utf-8"))
-                      except Exception:
-                          pass
-
-                  for date_str, new_codes in date_codes.items():
-                      old = existing.get(date_str)
-                      if old == "all_done":
-                          continue
-                      combined = set(old) | new_codes if isinstance(old, list) else set(new_codes)
-
-                      total = candidate_by_date.get(date_str, set())
-                      if total and combined >= total:
-                          existing[date_str] = "all_done"
-                          print(f"  {date_str}: all_done ({len(combined)}/{len(total)})")
-                      else:
-                          existing[date_str] = sorted(combined)
-
-                  path.parent.mkdir(parents=True, exist_ok=True)
-                  path.write_text(
-                      json.dumps(existing, ensure_ascii=False, indent=2) + "\n", "utf-8",
-                  )
-                  updated_yms.add(ym)
-                  print(f"Updated {path.name}")
-
-          print(f"Updated {len(updated_yms)} success JSON files")
-
-          # ── 3. Remove the batch file ──
+          # ── 2. Remove the batch file ──
           batch_file = repo_root / "data" / "content_batches" / f"batch_{batch_id}.json.gz"
           if batch_file.exists():
               batch_file.unlink()
               print(f"Removed batch file: batch_{batch_id}.json.gz")
 
-          # ── 4. Stage everything ──
+          # ── 3. Stage everything ──
           subprocess.run(
-              ["git", "add", "raw/content/", "data/content_fetch_success/", "data/content_batches/"],
+              ["git", "add", "raw/content/", "data/content_batches/"],
               cwd=str(repo_root), check=True,
           )
           print("Staged all changes")
@@ -432,7 +365,7 @@ jobs:
             git stash --include-untracked
             git pull --rebase origin "$BRANCH"
             git stash pop || true
-            # Re-run merge script to fix success JSON against latest HEAD
+            # Re-run merge script to handle part numbering against latest HEAD
             python3 /tmp/merge_and_stage.py
             if git diff --cached --quiet; then
               echo "No changes after re-merge"
