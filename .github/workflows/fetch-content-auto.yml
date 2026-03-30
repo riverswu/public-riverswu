@@ -73,8 +73,8 @@ jobs:
                       port=port,
                       password=password,
                       decode_responses=True,
-                      socket_timeout=30,
-                      socket_connect_timeout=30,
+                      socket_timeout=10,
+                      socket_connect_timeout=10,
                   )
                   r.ping()
                   print(f"Redis connected (attempt {attempt})")
@@ -105,24 +105,35 @@ jobs:
                   f.write("lock_token=\n")
               exit(0)
 
-          # Try to lock a batch
+          # Try to lock a batch — single Lua round trip instead of N*2 calls
           token = uuid.uuid4().hex
           locked_batch = None
           locked_file = None
 
+          # Build batch_id → file mapping
+          batch_map: dict[str, Path] = {}
           for bf in batch_files:
-              # e.g. batch_000.json.gz → batch_id = "000"
-              batch_id = bf.stem.split("_", 1)[1].split(".")[0]
-              lock_key = f"gp-announce:content-batch:{batch_id}:lock"
-              acquired = r.set(lock_key, token, nx=True, ex=LOCK_TTL)
-              if acquired:
-                  locked_batch = batch_id
-                  locked_file = bf
-                  print(f"Locked batch {batch_id} (key={lock_key})")
-                  break
-              else:
-                  holder = r.get(lock_key)
-                  print(f"  batch {batch_id}: already locked by {holder[:8]}...")
+              bid = bf.stem.split("_", 1)[1].split(".")[0]
+              batch_map[bid] = bf
+
+          # Lua: try SET NX EX on each key, return the first one that succeeds
+          lock_lua = """
+          local token = ARGV[1]
+          local ttl = tonumber(ARGV[2])
+          for i, key in ipairs(KEYS) do
+              if redis.call("SET", key, token, "NX", "EX", ttl) then
+                  return key
+              end
+          end
+          return nil
+          """
+          lock_keys = [f"gp-announce:content-batch:{bid}:lock" for bid in batch_map]
+          result = r.eval(lock_lua, len(lock_keys), *lock_keys, token, LOCK_TTL)
+          if result:
+              # result is the key that was locked, e.g. "gp-announce:content-batch:042:lock"
+              locked_batch = result.split(":")[2]
+              locked_file = batch_map[locked_batch]
+              print(f"Locked batch {locked_batch} (key={result})")
 
           if locked_batch is None:
               print("All batches are locked — nothing to do right now")
@@ -314,18 +325,22 @@ jobs:
               batch_file.unlink()
               print(f"Removed batch file: batch_{batch_id}.json.gz")
 
-          # ── 3. Stage everything ──
+          # ── 3. Stage new parquets + batch file deletion ──
+          # Add new parquet files by explicit path (works under sparse-checkout)
+          if new_parquets:
+              subprocess.run(
+                  ["git", "add", "--sparse"] + new_parquets,
+                  cwd=str(repo_root), check=True,
+              )
+          # Stage the batch file deletion (already in sparse-checkout cone)
           subprocess.run(
-              ["git", "add", "raw/content/", "data/content_batches/"],
+              ["git", "add", "data/content_batches/"],
               cwd=str(repo_root), check=True,
           )
           print("Staged all changes")
           PYEOF
 
-          # Disable sparse-checkout so git add works for all paths
-          git sparse-checkout disable
-
-          # Run the merge script
+          # Run the merge script (no need to disable sparse-checkout)
           python3 /tmp/merge_and_stage.py
 
           if git diff --cached --quiet; then
