@@ -66,30 +66,35 @@ jobs:
           print(f"Redis: {host}:{port}")
 
           r = None
-          for attempt in range(1, 4):
+          MAX_RETRIES = 5
+          for attempt in range(1, MAX_RETRIES + 1):
               try:
                   r = redis.Redis(
                       host=host,
                       port=port,
                       password=password,
                       decode_responses=True,
-                      socket_timeout=10,
-                      socket_connect_timeout=10,
+                      socket_timeout=15,
+                      socket_connect_timeout=15,
+                      retry_on_timeout=True,
                   )
                   r.ping()
                   print(f"Redis connected (attempt {attempt})")
                   break
               except Exception as e:
-                  print(f"Redis connect attempt {attempt}/3 failed: {e}")
-                  if attempt == 3:
-                      print("Redis unreachable after 3 attempts, skip this run")
+                  print(f"Redis connect attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                  if attempt == MAX_RETRIES:
+                      print(f"Redis unreachable after {MAX_RETRIES} attempts, skip this run")
                       with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                           f.write("runner_count=0\n")
                           f.write("total_codes=0\n")
                           f.write("batch_id=\n")
                           f.write("lock_token=\n")
                       exit(0)
-                  time.sleep(attempt * 5)
+                  import random as _rnd
+                  backoff = min(2 ** attempt, 30) + _rnd.uniform(0, 3)
+                  print(f"  retrying in {backoff:.1f}s...")
+                  time.sleep(backoff)
 
           # List batch files sorted ascending (batch_000, batch_001, ...)
           batches_dir = Path("data/content_batches")
