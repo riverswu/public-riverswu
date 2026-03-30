@@ -321,7 +321,15 @@ jobs:
                   pq_files = sorted(ym_dir.glob("*.parquet"))
                   if not pq_files:
                       continue
-                  frames = [pd.read_parquet(pq) for pq in pq_files]
+                  frames = []
+                  for pq in pq_files:
+                      try:
+                          frames.append(pd.read_parquet(pq))
+                      except Exception as e:
+                          print(f"  WARN: skipping corrupt file {pq.name}: {e}")
+                  if not frames:
+                      print(f"  {ym}: all files corrupt, skipping")
+                      continue
                   merged_df = pd.concat(frames, ignore_index=True)
                   parquet_count += len(merged_df)
 
