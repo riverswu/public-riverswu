@@ -276,7 +276,7 @@ jobs:
           Merge runner outputs into the repo working tree and stage changes.
           Idempotent: safe to re-run after git rebase.
           """
-          import os, re, subprocess
+          import os, subprocess
           from pathlib import Path
 
           results_dir = Path("/tmp/all-results")
@@ -284,21 +284,8 @@ jobs:
           raw_content = repo_root / "raw" / "content"
           batch_id = os.environ["BATCH_ID"]
 
-          # ── 0. Discover existing max part numbers ──
-          max_part: dict[str, int] = {}
-          ls = subprocess.run(
-              ["git", "ls-tree", "-r", "HEAD", "--name-only", "--", "raw/content/"],
-              capture_output=True, text=True, cwd=str(repo_root),
-          )
-          for line in (ls.stdout or "").strip().splitlines():
-              name = os.path.basename(line)
-              m = re.match(r"^(\d{6})_(\d{3})\.parquet$", name)
-              if m:
-                  ym, num = m.group(1), int(m.group(2))
-                  max_part[ym] = max(max_part.get(ym, 0), num)
-          print(f"Existing max part numbers: {max_part}")
-
           # ── 1. Merge runner parquets → one per month ──
+          # Filename uses batch_id so concurrent workflows never collide
           parquet_src = results_dir / "parquet"
           parquet_count = 0
           new_parquets: list[str] = []
@@ -315,12 +302,10 @@ jobs:
 
                   dest_dir = raw_content / ym
                   dest_dir.mkdir(parents=True, exist_ok=True)
-                  next_num = max_part.get(ym, 0) + 1
-                  dest = dest_dir / f"{ym}_{next_num:03d}.parquet"
+                  dest = dest_dir / f"{ym}_{batch_id}.parquet"
                   merged_df.to_parquet(dest, index=False)
                   new_parquets.append(str(dest.relative_to(repo_root)))
                   print(f"  {ym}: {len(pq_files)} runner files -> {dest.name} ({len(merged_df)} rows)")
-                  max_part[ym] = next_num
           print(f"Saved {parquet_count} rows in {len(new_parquets)} parquet(s)")
 
           # ── 2. Remove the batch file ──
@@ -359,20 +344,9 @@ jobs:
               echo "push_ok=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Push failed, rebase and re-merge (attempt $i/10)..."
-            # Reset to before our commit, pull latest, re-run merge, recommit
-            git reset --soft HEAD~1
-            git stash --include-untracked
+            echo "Push failed, rebase and retry (attempt $i/10)..."
+            # Filenames use batch_id, so no re-numbering needed — just rebase
             git pull --rebase origin "$BRANCH"
-            git stash pop || true
-            # Re-run merge script to handle part numbering against latest HEAD
-            python3 /tmp/merge_and_stage.py
-            if git diff --cached --quiet; then
-              echo "No changes after re-merge"
-              echo "push_ok=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
             sleep $((RANDOM % 5 + i * 2))
           done
           echo "Push failed after 10 attempts"
