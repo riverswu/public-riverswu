@@ -110,11 +110,20 @@ jobs:
           locked_batch = None
           locked_file = None
 
-          # Build batch_id → file mapping
+          # Build batch_id → file mapping (sorted ascending)
+          import random
           batch_map: dict[str, Path] = {}
           for bf in batch_files:
               bid = bf.stem.split("_", 1)[1].split(".")[0]
               batch_map[bid] = bf
+
+          # Randomize within a window to reduce contention across parallel workflows
+          WINDOW = 50
+          all_bids = list(batch_map.keys())  # already sorted from batch_files
+          head = all_bids[:WINDOW]
+          tail = all_bids[WINDOW:]
+          random.shuffle(head)
+          ordered_bids = head + tail
 
           # Lua: try SET NX EX on each key, return the first one that succeeds
           lock_lua = """
@@ -127,7 +136,7 @@ jobs:
           end
           return nil
           """
-          lock_keys = [f"gp-announce:content-batch:{bid}:lock" for bid in batch_map]
+          lock_keys = [f"gp-announce:content-batch:{bid}:lock" for bid in ordered_bids]
           result = r.eval(lock_lua, len(lock_keys), *lock_keys, token, LOCK_TTL)
           if result:
               # result is the key that was locked, e.g. "gp-announce:content-batch:042:lock"
@@ -349,20 +358,26 @@ jobs:
             exit 0
           fi
 
+          # Move HEAD to latest remote tip before committing, so our commit
+          # is based on the newest state. Staged changes are preserved since
+          # our files (batch_id names) don't exist in remote.
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git fetch --depth=1 origin "$BRANCH"
+          git reset --soft "origin/$BRANCH"
+
           git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
 
-          # Push with rebase-retry; re-run merge script after each rebase
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          for i in $(seq 1 10); do
+          # Push — almost always succeeds on first try now
+          for i in $(seq 1 5); do
             if git push origin "HEAD:$BRANCH" 2>/dev/null; then
               echo "Pushed (attempt $i)"
               echo "push_ok=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Push failed, rebase and retry (attempt $i/10)..."
-            # Filenames use batch_id, so no re-numbering needed — just rebase
-            git pull --rebase origin "$BRANCH"
-            sleep $((RANDOM % 5 + i * 2))
+            echo "Push failed (attempt $i/5), re-fetch + rebase..."
+            git fetch --depth=1 origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            sleep $((RANDOM % 3 + 1))
           done
           echo "Push failed after 10 attempts"
           echo "push_ok=false" >> "$GITHUB_OUTPUT"
