@@ -329,9 +329,11 @@ jobs:
                   ["git", "add", "--sparse"] + new_parquets,
                   cwd=str(repo_root), check=True,
               )
-          # Stage the batch file deletion (already in sparse-checkout cone)
+          # Stage ONLY our batch file deletion (not the whole directory,
+          # which would pick up stale files from initial checkout)
+          batch_file_rel = f"data/content_batches/batch_{batch_id}.json.gz"
           subprocess.run(
-              ["git", "add", "data/content_batches/"],
+              ["git", "add", batch_file_rel],
               cwd=str(repo_root), check=True,
           )
           print("Staged all changes")
@@ -346,22 +348,22 @@ jobs:
           fi
 
           # Move HEAD to latest remote tip, then re-stage only our files.
-          # reset --soft keeps the index, which may include OTHER workflows'
-          # changes as reverse diffs, so we must clear and re-add explicitly.
           BRANCH="${GITHUB_REF_NAME:-main}"
-          git fetch --depth=1 origin "$BRANCH"
-          git reset --soft "origin/$BRANCH"
-          git reset HEAD -- . >/dev/null 2>&1  # unstage everything
 
-          # Re-run merge script to re-stage only our own files
-          python3 /tmp/merge_and_stage.py
+          # Helper: fetch latest tip, reset to it, re-stage our files, commit
+          do_commit() {
+            git fetch --depth=1 origin "$BRANCH"
+            git reset --soft "origin/$BRANCH"
+            git reset HEAD -- . >/dev/null 2>&1  # unstage everything
+            python3 /tmp/merge_and_stage.py       # re-stage only our files
+            if git diff --cached --quiet; then
+              echo "No changes to push (after re-stage)"
+              return 1
+            fi
+            git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
+          }
 
-          if git diff --cached --quiet; then
-            echo "No changes to push (after re-stage)"
-            exit 0
-          fi
-
-          git commit -m "chore: auto-fetch batch ${BATCH_ID} $(date +%Y%m%d_%H%M%S)"
+          do_commit || exit 0
 
           # Push — almost always succeeds on first try now
           for i in $(seq 1 5); do
@@ -369,9 +371,8 @@ jobs:
               echo "Pushed (attempt $i)"
               exit 0
             fi
-            echo "Push failed (attempt $i/5), re-fetch + rebase..."
-            git fetch --depth=1 origin "$BRANCH"
-            git rebase "origin/$BRANCH"
+            echo "Push failed (attempt $i/5), re-commit on latest tip..."
+            do_commit || exit 0
             sleep $((RANDOM % 3 + 1))
           done
           echo "Push failed after 5 attempts"
